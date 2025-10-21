@@ -1,317 +1,228 @@
 package org;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
 
-/**
- * Класс StringBuilder с возможностью оповещения наблюдателей об изменениях
- */
 public class ObservableStringBuilder {
-    private StringBuilder stringBuilder;
-    private List<ChangeObserver> observers;
+    private final StringBuilder delegate;
+    private final Map<String, ChangeObserver> observers = new ConcurrentHashMap<>();
+    private final Lock lock;
+    private Deque<String> history;
+    private final int maxHistorySize;
 
-    public ObservableStringBuilder() {
-        this.stringBuilder = new StringBuilder();
-        this.observers = new ArrayList<>();
-    }
+    public ObservableStringBuilder(String initial, boolean threadSafe, int historySize) {
+        this.delegate = new StringBuilder(initial);
+        this.lock = threadSafe ? new ReentrantLock() : new NoOpLock();
+        this.maxHistorySize = historySize;
 
-    public ObservableStringBuilder(String str) {
-        this.stringBuilder = new StringBuilder(str);
-        this.observers = new ArrayList<>();
-    }
-
-    public ObservableStringBuilder(int capacity) {
-        this.stringBuilder = new StringBuilder(capacity);
-        this.observers = new ArrayList<>();
-    }
-
-    /**
-     * Добавляет наблюдателя
-     */
-    public void addObserver(ChangeObserver observer) {
-        if (observer != null && !observers.contains(observer)) {
-            observers.add(observer);
+        if (historySize > 0) {
+            this.history = new ArrayDeque<>();
+            saveToHistory(initial);
         }
     }
 
-    /**
-     * Удаляет наблюдателя
-     */
-    public void removeObserver(ChangeObserver observer) {
-        observers.remove(observer);
+    public void addObserver(String name, ChangeObserver observer) {
+        if (name == null || observer == null) return;
+        observers.put(name, observer);
     }
 
-    /**
-     * Уведомляет всех наблюдателей об изменении
-     */
-    private void notifyObservers(String oldValue, String newValue) {
-        for (ChangeObserver observer : observers) {
-            observer.onChange(oldValue, newValue);
+    public void addOneTimeObserver(ChangeObserver observer) {
+        if (observer != null) {
+            String tempName = "onetime_" + System.currentTimeMillis();
+            addObserver(tempName, event -> {
+                try {
+                    observer.onChange(event);
+                } finally {
+                    removeObserver(tempName);
+                }
+            });
         }
     }
 
-    // Делегированные методы StringBuilder с уведомлением наблюдателей
-
-    public ObservableStringBuilder append(String str) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.append(str);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
+    public void removeObserver(String name) {
+        observers.remove(name);
     }
 
-    public ObservableStringBuilder append(Object obj) {
-        return append(String.valueOf(obj));
+    public int getObserverCount() {
+        return observers.size();
     }
 
-    public ObservableStringBuilder append(StringBuffer sb) {
-        return append(sb.toString());
+    public int getHistorySize() {
+        return history != null ? history.size() : 0;
     }
 
-    public ObservableStringBuilder append(CharSequence s) {
-        return append(s.toString());
+    public void append(String str) {
+        if (str == null) return;
+
+        lock.lock();
+        try {
+            String oldValue = delegate.toString();
+            delegate.append(str);
+            handleChange(oldValue, StringBuilderChangeEvent.ChangeType.APPEND, str);
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public ObservableStringBuilder append(CharSequence s, int start, int end) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.append(s, start, end);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
+    public void append(Object obj) {
+        append(String.valueOf(obj));
     }
 
-    public ObservableStringBuilder append(char[] str) {
-        return append(new String(str));
+    public void append(int value) {
+        append(String.valueOf(value));
     }
 
-    public ObservableStringBuilder append(char[] str, int offset, int len) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.append(str, offset, len);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
+    public void append(char c) {
+        lock.lock();
+        try {
+            String oldValue = delegate.toString();
+            delegate.append(c);
+            handleChange(oldValue, StringBuilderChangeEvent.ChangeType.APPEND, c);
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public ObservableStringBuilder append(boolean b) {
-        return append(String.valueOf(b));
+    public void delete(int start, int end) {
+        lock.lock();
+        try {
+            String oldValue = delegate.toString();
+            String deleted = oldValue.substring(start, end);
+            delegate.delete(start, end);
+
+            Map<String, Object> context = new HashMap<>();
+            context.put("start", start);
+            context.put("end", end);
+            context.put("deleted", deleted);
+
+            handleChange(oldValue, StringBuilderChangeEvent.ChangeType.DELETE, context);
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public ObservableStringBuilder append(char c) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.append(c);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
+    public void replace(int start, int end, String replacement) {
+        lock.lock();
+        try {
+            String oldValue = delegate.toString();
+            String original = delegate.substring(start, end);
+            delegate.replace(start, end, replacement);
+
+            Map<String, Object> context = new HashMap<>();
+            context.put("start", start);
+            context.put("end", end);
+            context.put("original", original);
+            context.put("replacement", replacement);
+
+            handleChange(oldValue, StringBuilderChangeEvent.ChangeType.REPLACE, context);
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public ObservableStringBuilder append(int i) {
-        return append(String.valueOf(i));
+    public void undo() {
+        if (history == null || history.size() <= 1) return;
+
+        lock.lock();
+        try {
+            String current = delegate.toString();
+            history.pop();
+            String previous = history.peek();
+
+            if (!current.equals(previous)) {
+                delegate.setLength(0);
+                delegate.append(previous);
+                notifyObservers(current, previous, StringBuilderChangeEvent.ChangeType.UNDO, null);
+            }
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public ObservableStringBuilder append(long lng) {
-        return append(String.valueOf(lng));
+    public void insert(int index, String str) {
+        lock.lock();
+        try {
+            String oldValue = delegate.toString();
+            delegate.insert(index, str);
+
+            Map<String, Object> context = new HashMap<>();
+            context.put("index", index);
+            context.put("value", str);
+
+            handleChange(oldValue, StringBuilderChangeEvent.ChangeType.INSERT, context);
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public ObservableStringBuilder append(float f) {
-        return append(String.valueOf(f));
+    public void reverse() {
+        lock.lock();
+        try {
+            String oldValue = delegate.toString();
+            delegate.reverse();
+            handleChange(oldValue, StringBuilderChangeEvent.ChangeType.REVERSE, null);
+        } finally {
+            lock.unlock();
+        }
     }
 
-    public ObservableStringBuilder append(double d) {
-        return append(String.valueOf(d));
+    private void handleChange(String oldValue, StringBuilderChangeEvent.ChangeType type, Object context) {
+        String newValue = delegate.toString();
+
+        if (oldValue.equals(newValue)) return;
+
+        if (history != null) {
+            saveToHistory(newValue);
+        }
+
+        notifyObservers(oldValue, newValue, type, context);
     }
 
-    public ObservableStringBuilder insert(int index, char[] str, int offset, int len) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(index, str, offset, len);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
+    private void saveToHistory(String state) {
+        history.push(state);
+        while (history.size() > maxHistorySize) {
+            history.removeLast();
+        }
     }
 
-    public ObservableStringBuilder insert(int offset, Object obj) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, obj);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
+    private void notifyObservers(String oldValue, String newValue,
+                                 StringBuilderChangeEvent.ChangeType changeType,
+                                 Object changeContext) {
+        if (observers.isEmpty()) return;
 
-    public ObservableStringBuilder insert(int offset, String str) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, str);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
+        StringBuilderChangeEvent event = new StringBuilderChangeEvent(
+                this, oldValue, newValue, changeType, changeContext);
 
-    public ObservableStringBuilder insert(int offset, char[] str) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, str);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
+        for (ChangeObserver observer : observers.values()) {
+            try {
+                observer.onChange(event);
+            } catch (Exception e) {
+                System.err.println("Observer error: " + e.getMessage());
+            }
+        }
     }
-
-    public ObservableStringBuilder insert(int dstOffset, CharSequence s) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(dstOffset, s);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder insert(int dstOffset, CharSequence s, int start, int end) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(dstOffset, s, start, end);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder insert(int offset, boolean b) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, b);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder insert(int offset, char c) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, c);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder insert(int offset, int i) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, i);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder insert(int offset, long l) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, l);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder insert(int offset, float f) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, f);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder insert(int offset, double d) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.insert(offset, d);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder delete(int start, int end) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.delete(start, end);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder deleteCharAt(int index) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.deleteCharAt(index);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder replace(int start, int end, String str) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.replace(start, end, str);
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public ObservableStringBuilder reverse() {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.reverse();
-        notifyObservers(oldValue, stringBuilder.toString());
-        return this;
-    }
-
-    public void setLength(int newLength) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.setLength(newLength);
-        notifyObservers(oldValue, stringBuilder.toString());
-    }
-
-    public void setCharAt(int index, char ch) {
-        String oldValue = stringBuilder.toString();
-        stringBuilder.setCharAt(index, ch);
-        notifyObservers(oldValue, stringBuilder.toString());
-    }
-
-    // Методы без изменения состояния (не уведомляют наблюдателей)
 
     public int length() {
-        return stringBuilder.length();
-    }
-
-    public int capacity() {
-        return stringBuilder.capacity();
-    }
-
-    public void ensureCapacity(int minimumCapacity) {
-        stringBuilder.ensureCapacity(minimumCapacity);
-    }
-
-    public void trimToSize() {
-        stringBuilder.trimToSize();
-    }
-
-    public char charAt(int index) {
-        return stringBuilder.charAt(index);
-    }
-
-    public int codePointAt(int index) {
-        return stringBuilder.codePointAt(index);
-    }
-
-    public int codePointBefore(int index) {
-        return stringBuilder.codePointBefore(index);
-    }
-
-    public int codePointCount(int beginIndex, int endIndex) {
-        return stringBuilder.codePointCount(beginIndex, endIndex);
-    }
-
-    public int offsetByCodePoints(int index, int codePointOffset) {
-        return stringBuilder.offsetByCodePoints(index, codePointOffset);
-    }
-
-    public void getChars(int srcBegin, int srcEnd, char[] dst, int dstBegin) {
-        stringBuilder.getChars(srcBegin, srcEnd, dst, dstBegin);
-    }
-
-    public int indexOf(String str) {
-        return stringBuilder.indexOf(str);
-    }
-
-    public int indexOf(String str, int fromIndex) {
-        return stringBuilder.indexOf(str, fromIndex);
-    }
-
-    public int lastIndexOf(String str) {
-        return stringBuilder.lastIndexOf(str);
-    }
-
-    public int lastIndexOf(String str, int fromIndex) {
-        return stringBuilder.lastIndexOf(str, fromIndex);
-    }
-
-    public CharSequence subSequence(int start, int end) {
-        return stringBuilder.subSequence(start, end);
-    }
-
-    public String substring(int start) {
-        return stringBuilder.substring(start);
-    }
-
-    public String substring(int start, int end) {
-        return stringBuilder.substring(start, end);
+        return delegate.length();
     }
 
     @Override
     public String toString() {
-        return stringBuilder.toString();
+        return delegate.toString();
+    }
+
+    private static class NoOpLock implements Lock {
+        @Override public void lock() {}
+        @Override public void lockInterruptibly() {}
+        @Override public boolean tryLock() { return true; }
+        @Override public boolean tryLock(long time, TimeUnit unit) { return true; }
+        @Override public void unlock() {}
+        @Override public Condition newCondition() {
+            throw new UnsupportedOperationException("No conditions for no-op lock");
+        }
     }
 }

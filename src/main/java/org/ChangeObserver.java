@@ -3,11 +3,11 @@ package org;
 /**
  * Интерфейс наблюдателя за изменениями ObservableStringBuilder
  */
+@FunctionalInterface
 public interface ChangeObserver {
     /**
      * Вызывается при изменении состояния ObservableStringBuilder
-     * @param oldValue предыдущее значение строки
-     * @param newValue новое значение строки
+     * @param event объект события с детальной информацией об изменении
      */
-    void onChange(String oldValue, String newValue);
+    void onChange(StringBuilderChangeEvent event);
 }
